@@ -17,7 +17,7 @@
 
 # ─── Config ───────────────────────────────────────────────────────────
 PROCESSES=("chrome" "cursor" "thunderbird-bin" "obsidian" "masterpdf" "antigravity")
-POLL_INTERVAL_SEC=1
+DISCOVERY_INTERVAL_SEC=10   # how often the background loop rescans for new PIDs
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
@@ -205,8 +205,12 @@ migrate_pids() {
 }
 
 # ─── Lifecycle ────────────────────────────────────────────────────────
+DISCOVERY_PID=
+XPROP_PID=
 cleanup() {
     echo "Restoring all processes..."
+    [[ -n "$XPROP_PID"     ]] && kill "$XPROP_PID"     2>/dev/null
+    [[ -n "$DISCOVERY_PID" ]] && kill "$DISCOVERY_PID" 2>/dev/null
     # wake() resets each slice to FG defaults (unlimited). We deliberately
     # leave the slices themselves in place so that running PIDs are not
     # orphaned back to user.slice and bounced again on next script start.
@@ -217,49 +221,63 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-get_focused_proc_name() {
-    local wid pid
-    wid=$(xdotool getwindowfocus 2>/dev/null) || return
-    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || return
+pid_to_proc_name() {
+    local pid=$1
     [[ -n "$pid" && -d "/proc/$pid" ]] || return
-    cat "/proc/$pid/comm"
+    cat "/proc/$pid/comm" 2>/dev/null
 }
 
-# ─── Main loop ────────────────────────────────────────────────────────
+# ─── Focus state machine ─────────────────────────────────────────────
+declare -A PROC_STATE
+for PROC in "${PROCESSES[@]}"; do PROC_STATE[$PROC]="UNKNOWN"; done
+
+apply_focus_state() {
+    local focused=$1
+    for PROC in "${PROCESSES[@]}"; do
+        if [[ "$PROC" == "$focused" ]]; then
+            if [[ "${PROC_STATE[$PROC]}" != "FG" ]]; then
+                wake "$PROC"; echo "FG: $PROC"; PROC_STATE[$PROC]="FG"
+            fi
+        else
+            if [[ "${PROC_STATE[$PROC]}" != "BG" ]]; then
+                park "$PROC"; echo "BG: $PROC"; PROC_STATE[$PROC]="BG"
+            fi
+        fi
+    done
+}
+
+# ─── Main ────────────────────────────────────────────────────────────
 detect_topology
 resolve_pin_mode
 check_cpuset_delegation
 echo "PIN_MODE=$PIN_MODE"
 setup_slices
 
-declare -A PROC_STATE
-for PROC in "${PROCESSES[@]}"; do
-    PROC_STATE[$PROC]="UNKNOWN"
-done
-
-while true; do
-    FOCUSED=$(get_focused_proc_name)
-    if [[ -n "$FOCUSED" ]]; then
-        echo "Focused: $FOCUSED"
-    else
-        echo "No focused process."
-    fi
-
-    for PROC in "${PROCESSES[@]}"; do
-        migrate_pids "$PROC"
-        if [[ "$PROC" == "$FOCUSED" ]]; then
-            if [[ "${PROC_STATE[$PROC]}" != "FG" ]]; then
-                wake "$PROC"
-                echo "FG: $PROC"
-                PROC_STATE[$PROC]="FG"
-            fi
-        else
-            if [[ "${PROC_STATE[$PROC]}" != "BG" ]]; then
-                park "$PROC"
-                echo "BG: $PROC"
-                PROC_STATE[$PROC]="BG"
-            fi
-        fi
+# Discovery loop in the background — catches newly-spawned PIDs at
+# coarse cadence (no need to scan every second now that focus is event-
+# driven).
+(
+    while true; do
+        for PROC in "${PROCESSES[@]}"; do
+            migrate_pids "$PROC"
+        done
+        sleep "$DISCOVERY_INTERVAL_SEC"
     done
-    sleep "$POLL_INTERVAL_SEC"
+) &
+DISCOVERY_PID=$!
+
+# Seed the initial focus state, then enter the event loop.
+INITIAL_PID=$(xdotool getwindowpid "$(xdotool getwindowfocus 2>/dev/null)" 2>/dev/null)
+apply_focus_state "$(pid_to_proc_name "$INITIAL_PID")"
+
+# xprop -spy streams a line every time _NET_ACTIVE_WINDOW changes —
+# zero polling latency, one-line update on focus. Run as a coproc so we
+# can kill it from cleanup() without waiting for the read loop to unblock.
+coproc XPROP { exec xprop -root -spy _NET_ACTIVE_WINDOW 2>/dev/null; }
+XPROP_PID=$XPROP_PID
+while read -r line <&"${XPROP[0]}"; do
+    wid=${line##* }
+    [[ "$wid" =~ ^0x[0-9a-fA-F]+$ ]] || continue
+    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || continue
+    apply_focus_state "$(pid_to_proc_name "$pid")"
 done
