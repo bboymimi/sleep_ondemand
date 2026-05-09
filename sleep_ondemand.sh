@@ -10,9 +10,22 @@
 PROCESSES=("chrome" "cursor" "thunderbird-bin" "obsidian" "masterpdf" "antigravity")
 POLL_INTERVAL_SEC=1
 
+FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
+FG_CPUWEIGHT=100
+BG_CPUQUOTA="5%"
+BG_CPUWEIGHT=10
+
 # ─── Backend hooks ────────────────────────────────────────────────────
-park() { pkill -STOP -f "$1"; }
-wake() { pkill -CONT -f "$1"; }
+# CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
+# and remote-agent heartbeats keep flowing while CPU is starved.
+park() {
+    systemctl --user set-property "$(slice_unit_for "$1")" \
+        CPUQuota="$BG_CPUQUOTA" CPUWeight="$BG_CPUWEIGHT" 2>/dev/null || true
+}
+wake() {
+    systemctl --user set-property "$(slice_unit_for "$1")" \
+        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
+}
 
 detect_topology() { :; }
 apply_tier()      { :; }
@@ -60,6 +73,9 @@ migrate_pids() {
 # ─── Lifecycle ────────────────────────────────────────────────────────
 cleanup() {
     echo "Restoring all processes..."
+    # wake() resets each slice to FG defaults (unlimited). We deliberately
+    # leave the slices themselves in place so that running PIDs are not
+    # orphaned back to user.slice and bounced again on next script start.
     for PROC in "${PROCESSES[@]}"; do
         wake "$PROC"
     done
@@ -79,9 +95,9 @@ get_focused_proc_name() {
 detect_topology
 setup_slices
 
-declare -A PROC_STATUS
+declare -A PROC_STATE
 for PROC in "${PROCESSES[@]}"; do
-    PROC_STATUS[$PROC]="UNKNOWN"
+    PROC_STATE[$PROC]="UNKNOWN"
 done
 
 while true; do
@@ -95,16 +111,16 @@ while true; do
     for PROC in "${PROCESSES[@]}"; do
         migrate_pids "$PROC"
         if [[ "$PROC" == "$FOCUSED" ]]; then
-            if [[ "${PROC_STATUS[$PROC]}" != "RUNNING" ]]; then
+            if [[ "${PROC_STATE[$PROC]}" != "FG" ]]; then
                 wake "$PROC"
-                echo "Wake up $PROC!"
-                PROC_STATUS[$PROC]="RUNNING"
+                echo "FG: $PROC"
+                PROC_STATE[$PROC]="FG"
             fi
         else
-            if [[ "${PROC_STATUS[$PROC]}" != "STOPPED" ]]; then
+            if [[ "${PROC_STATE[$PROC]}" != "BG" ]]; then
                 park "$PROC"
-                echo "Stop $PROC"
-                PROC_STATUS[$PROC]="STOPPED"
+                echo "BG: $PROC"
+                PROC_STATE[$PROC]="BG"
             fi
         fi
     done
