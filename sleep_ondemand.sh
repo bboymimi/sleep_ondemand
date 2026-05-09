@@ -12,19 +12,25 @@ POLL_INTERVAL_SEC=1
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
+FG_CPU_IDLE=0            # 0 = normal scheduling
 BG_CPUQUOTA="5%"
 BG_CPUWEIGHT=10
+BG_CPU_IDLE=1            # 1 = SCHED_IDLE: never preempts foreground
 
 # ─── Backend hooks ────────────────────────────────────────────────────
 # CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
 # and remote-agent heartbeats keep flowing while CPU is starved.
 park() {
+    local dir; dir=$(slice_dir_for "$1")
     systemctl --user set-property "$(slice_unit_for "$1")" \
         CPUQuota="$BG_CPUQUOTA" CPUWeight="$BG_CPUWEIGHT" 2>/dev/null || true
+    echo "$BG_CPU_IDLE" > "$dir/cpu.idle" 2>/dev/null || true
 }
 wake() {
+    local dir; dir=$(slice_dir_for "$1")
     systemctl --user set-property "$(slice_unit_for "$1")" \
         CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
+    echo "$FG_CPU_IDLE" > "$dir/cpu.idle" 2>/dev/null || true
 }
 
 detect_topology() { :; }
