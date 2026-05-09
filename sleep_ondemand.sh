@@ -17,6 +17,46 @@ wake() { pkill -CONT -f "$1"; }
 detect_topology() { :; }
 apply_tier()      { :; }
 
+# ─── Slice scaffolding ────────────────────────────────────────────────
+# systemd's slice naming uses '-' as a hierarchy separator: "a-b-c.slice"
+# is read as a.slice/a-b.slice/a-b-c.slice. Process names containing
+# hyphens (thunderbird-bin) get sanitised to underscores so we land at
+# exactly two levels: sondemand.slice/sondemand-<proc>.slice.
+SLICE_PARENT_NAME=sondemand.slice
+SLICE_ROOT_DIR=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/$SLICE_PARENT_NAME
+
+slice_unit_for() { echo "sondemand-${1//-/_}.slice"; }
+slice_dir_for()  { echo "$SLICE_ROOT_DIR/$(slice_unit_for "$1")"; }
+
+ensure_slice() {
+    local unit=$1
+    systemctl --user -q is-active "$unit" 2>/dev/null && return 0
+    # Transient scope inside the slice; the scope exits but the slice
+    # persists, which is what we want.
+    systemd-run --user --quiet --scope --slice="$unit" \
+        --unit="cgcreate-$$-$RANDOM" -- /bin/true >/dev/null 2>&1 || true
+}
+
+setup_slices() {
+    ensure_slice "$SLICE_PARENT_NAME"
+    for proc in "${PROCESSES[@]}"; do
+        ensure_slice "$(slice_unit_for "$proc")"
+    done
+}
+
+migrate_pids() {
+    local proc=$1
+    local dir; dir=$(slice_dir_for "$proc")
+    [[ -d "$dir" ]] || return 0
+    declare -A in_slice
+    local p
+    while read -r p; do in_slice[$p]=1; done < "$dir/cgroup.procs"
+    while read -r p; do
+        [[ -z "$p" || -n "${in_slice[$p]}" ]] && continue
+        echo "$p" > "$dir/cgroup.procs" 2>/dev/null || true
+    done < <(pgrep -f "$proc" 2>/dev/null)
+}
+
 # ─── Lifecycle ────────────────────────────────────────────────────────
 cleanup() {
     echo "Restoring all processes..."
@@ -37,6 +77,7 @@ get_focused_proc_name() {
 
 # ─── Main loop ────────────────────────────────────────────────────────
 detect_topology
+setup_slices
 
 declare -A PROC_STATUS
 for PROC in "${PROCESSES[@]}"; do
@@ -52,6 +93,7 @@ while true; do
     fi
 
     for PROC in "${PROCESSES[@]}"; do
+        migrate_pids "$PROC"
         if [[ "$PROC" == "$FOCUSED" ]]; then
             if [[ "${PROC_STATUS[$PROC]}" != "RUNNING" ]]; then
                 wake "$PROC"
