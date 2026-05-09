@@ -60,8 +60,64 @@ wake() {
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
 }
 
-detect_topology() { :; }
-apply_tier()      { :; }
+apply_tier() { :; }
+
+# ─── CPU topology detection ───────────────────────────────────────────
+# Globals populated by detect_topology(). Empty when not on a hybrid CPU.
+HYBRID=0
+P_CORES=""        # e.g. "0-3"
+REG_E_CORES=""    # regular E-cores, e.g. "4-11"
+LP_E_CORES=""     # low-power E-cores on the SoC tile, e.g. "12-13"
+ALL_E_CORES=""    # union of REG_E_CORES + LP_E_CORES, e.g. "4-13"
+
+# Expand a CPU range like "4-13" or "0,2,4-7" to a space-separated list.
+seq_from_range() {
+    local out=""
+    local IFS=,
+    for chunk in $1; do
+        if [[ "$chunk" == *-* ]]; then
+            out+="$(seq "${chunk%-*}" "${chunk#*-}") "
+        else
+            out+="$chunk "
+        fi
+    done
+    echo "${out% }"
+}
+
+detect_topology() {
+    [[ -d /sys/devices/cpu_core && -d /sys/devices/cpu_atom ]] || {
+        echo "topology: not a hybrid CPU; cpuset pinning disabled"
+        return
+    }
+    HYBRID=1
+    P_CORES=$(cat /sys/devices/cpu_core/cpus)
+    local atoms; atoms=$(cat /sys/devices/cpu_atom/cpus)
+
+    # Atoms with the lowest cpuinfo_max_freq are LP E-cores (the SoC
+    # tile cluster on Meteor Lake runs at ~2.1 GHz vs ~3.8 GHz for
+    # compute-tile E-cores).
+    local cpu min_freq=2147483647
+    declare -A freq
+    for cpu in $(seq_from_range "$atoms"); do
+        local f
+        f=$(cat "/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq" 2>/dev/null) \
+            || f=0
+        freq[$cpu]=$f
+        (( f > 0 && f < min_freq )) && min_freq=$f
+    done
+    local lp="" reg=""
+    for cpu in $(seq_from_range "$atoms"); do
+        if (( freq[$cpu] == min_freq )); then
+            lp+="$cpu,"
+        else
+            reg+="$cpu,"
+        fi
+    done
+    LP_E_CORES=${lp%,}
+    REG_E_CORES=${reg%,}
+    ALL_E_CORES="${REG_E_CORES}${REG_E_CORES:+,}${LP_E_CORES}"
+    echo "topology: hybrid CPU detected — P=$P_CORES regE=$REG_E_CORES LP-E=$LP_E_CORES"
+}
 
 # ─── Slice scaffolding ────────────────────────────────────────────────
 # systemd's slice naming uses '-' as a hierarchy separator: "a-b-c.slice"
