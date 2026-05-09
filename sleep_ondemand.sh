@@ -16,8 +16,16 @@
 # Origin notes: https://www.perplexity.ai/search/to-optimize-the-power-manageme-wBNWVr8IRQClsvu2sFBS0w
 
 # ─── Config ───────────────────────────────────────────────────────────
-PROCESSES=("chrome" "cursor" "thunderbird-bin" "obsidian" "masterpdf" "antigravity")
+# Discovered automatically from app.slice scopes; APP_TIER below pins
+# specific names to TIGHT/LOOSE, anything else falls into DEFAULT_TIER.
+PROCESSES=()
 DISCOVERY_INTERVAL_SEC=10   # how often the background loop rescans for new PIDs
+
+# Hard refusal list: any process whose comm matches will never be added
+# to PROCESSES regardless of where its scope sits. The app.slice filter
+# already excludes session.slice / system.slice, so this is belt-and-
+# braces against systemd reorganising things.
+NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|sudo|gnome-terminal-)$'
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
@@ -184,13 +192,6 @@ ensure_slice() {
         --unit="cgcreate-$$-$RANDOM" -- /bin/true >/dev/null 2>&1 || true
 }
 
-setup_slices() {
-    ensure_slice "$SLICE_PARENT_NAME"
-    for proc in "${PROCESSES[@]}"; do
-        ensure_slice "$(slice_unit_for "$proc")"
-    done
-}
-
 migrate_pids() {
     local proc=$1
     local dir; dir=$(slice_dir_for "$proc")
@@ -204,13 +205,60 @@ migrate_pids() {
     done < <(pgrep -f "$proc" 2>/dev/null)
 }
 
+# Walk app.slice scopes and rebuild PROCESSES. Called at startup and
+# periodically. Idempotent: existing slices are reused, existing
+# PROC_STATE entries preserved.
+USER_APP_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.slice
+
+friendly_name_from_scope() {
+    # app-gnome-cursor-1234.scope                 -> cursor
+    # app-org.chromium.Chromium-NNN.scope         -> chromium  (last dotted)
+    # app-codex-desktop-NNN.scope                 -> codex-desktop
+    # app-gnome-codex\x2ddesktop-NNN.scope        -> codex-desktop (unescaped)
+    # snap.thunderbird.thunderbird-XX.scope       -> thunderbird
+    local s=$1 n
+    s=${s//\\x2d/-}                       # systemd escapes hyphens
+    if   [[ "$s" =~ ^app-(.+)-[0-9]+\.scope$ ]]; then
+        n=${BASH_REMATCH[1]}
+        n=${n##*.}                        # last dotted component (org.foo.Bar -> Bar)
+        n=${n#gnome-}                     # strip launcher prefix if present
+        n=${n#flatpak-}
+    elif [[ "$s" =~ ^snap\.([^.]+)\..+\.scope$ ]]; then
+        n=${BASH_REMATCH[1]}
+    else
+        return 1
+    fi
+    echo "${n,,}"
+}
+
+discover() {
+    [[ -d "$USER_APP_SLICE" ]] || return
+    declare -A seen=()
+    local scope_dir scope name pid comm proc
+    # Carry forward already-managed apps so that we keep flipping their
+    # limits even after migrate_pids has emptied their original scope.
+    for proc in "${PROCESSES[@]}"; do seen[$proc]=1; done
+    for scope_dir in "$USER_APP_SLICE"/*.scope; do
+        [[ -d "$scope_dir" ]] || continue
+        scope=$(basename "$scope_dir")
+        name=$(friendly_name_from_scope "$scope") || continue
+        pid=$(head -1 "$scope_dir/cgroup.procs" 2>/dev/null)
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+        [[ -n "$comm" && "$comm" =~ $NEVER_THROTTLE_REGEX ]] && continue
+        seen[$name]=1
+    done
+    PROCESSES=( "${!seen[@]}" )
+    for proc in "${PROCESSES[@]}"; do
+        [[ -z "${PROC_STATE[$proc]}" ]] && PROC_STATE[$proc]=UNKNOWN
+        ensure_slice "$(slice_unit_for "$proc")"
+    done
+}
+
 # ─── Lifecycle ────────────────────────────────────────────────────────
-DISCOVERY_PID=
 XPROP_PID=
 cleanup() {
     echo "Restoring all processes..."
-    [[ -n "$XPROP_PID"     ]] && kill "$XPROP_PID"     2>/dev/null
-    [[ -n "$DISCOVERY_PID" ]] && kill "$DISCOVERY_PID" 2>/dev/null
+    [[ -n "$XPROP_PID" ]] && kill "$XPROP_PID" 2>/dev/null
     # wake() resets each slice to FG defaults (unlimited). We deliberately
     # leave the slices themselves in place so that running PIDs are not
     # orphaned back to user.slice and bounced again on next script start.
@@ -228,8 +276,7 @@ pid_to_proc_name() {
 }
 
 # ─── Focus state machine ─────────────────────────────────────────────
-declare -A PROC_STATE
-for PROC in "${PROCESSES[@]}"; do PROC_STATE[$PROC]="UNKNOWN"; done
+declare -A PROC_STATE  # populated by discover()
 
 apply_focus_state() {
     local focused=$1
@@ -251,33 +298,37 @@ detect_topology
 resolve_pin_mode
 check_cpuset_delegation
 echo "PIN_MODE=$PIN_MODE"
-setup_slices
 
-# Discovery loop in the background — catches newly-spawned PIDs at
-# coarse cadence (no need to scan every second now that focus is event-
-# driven).
-(
-    while true; do
-        for PROC in "${PROCESSES[@]}"; do
-            migrate_pids "$PROC"
-        done
-        sleep "$DISCOVERY_INTERVAL_SEC"
-    done
-) &
-DISCOVERY_PID=$!
+ensure_slice "$SLICE_PARENT_NAME"
+discover
+echo "discovered: ${PROCESSES[*]}"
+for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
+LAST_DISCOVERY=$(date +%s)
 
-# Seed the initial focus state, then enter the event loop.
+# Seed the initial focus state.
 INITIAL_PID=$(xdotool getwindowpid "$(xdotool getwindowfocus 2>/dev/null)" 2>/dev/null)
 apply_focus_state "$(pid_to_proc_name "$INITIAL_PID")"
 
-# xprop -spy streams a line every time _NET_ACTIVE_WINDOW changes —
-# zero polling latency, one-line update on focus. Run as a coproc so we
-# can kill it from cleanup() without waiting for the read loop to unblock.
+# xprop -spy emits a line whenever _NET_ACTIVE_WINDOW changes (≤10 ms
+# focus latency). `read -t` doubles as a watchdog: if no focus event
+# fires within DISCOVERY_INTERVAL_SEC the read times out, giving us a
+# regular cadence to rescan app.slice and migrate newly-spawned PIDs.
+# Run xprop in a coproc with `exec` so $XPROP_PID is xprop itself —
+# cleanup() can kill it directly and the read unblocks immediately.
 coproc XPROP { exec xprop -root -spy _NET_ACTIVE_WINDOW 2>/dev/null; }
 XPROP_PID=$XPROP_PID
-while read -r line <&"${XPROP[0]}"; do
-    wid=${line##* }
-    [[ "$wid" =~ ^0x[0-9a-fA-F]+$ ]] || continue
-    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || continue
-    apply_focus_state "$(pid_to_proc_name "$pid")"
+while true; do
+    if read -t "$DISCOVERY_INTERVAL_SEC" -r line <&"${XPROP[0]}"; then
+        wid=${line##* }
+        if [[ "$wid" =~ ^0x[0-9a-fA-F]+$ ]]; then
+            pid=$(xdotool getwindowpid "$wid" 2>/dev/null)
+            apply_focus_state "$(pid_to_proc_name "$pid")"
+        fi
+    fi
+    now=$(date +%s)
+    if (( now - LAST_DISCOVERY >= DISCOVERY_INTERVAL_SEC )); then
+        discover
+        for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
+        LAST_DISCOVERY=$now
+    fi
 done
