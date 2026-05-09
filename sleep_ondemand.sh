@@ -1,53 +1,70 @@
 #!/bin/bash
-# List of managed process names
-# https://www.perplexity.ai/search/to-optimize-the-power-manageme-wBNWVr8IRQClsvu2sFBS0w
-PROCESSES=("chrome" "cursor" "anki" "thunderbird-bin" "obsidian" "masterpdf")
+# Park unfocused desktop apps to save power. Network sessions (Cursor remote
+# agent, Antigravity, IMAP IDLE) need to keep their TCP keepalives flowing,
+# which is why this lives in user space watching focus rather than relying
+# on the kernel idle detection alone.
+#
+# Origin notes: https://www.perplexity.ai/search/to-optimize-the-power-manageme-wBNWVr8IRQClsvu2sFBS0w
 
-# Cleanup function to resume all processes
+# ─── Config ───────────────────────────────────────────────────────────
+PROCESSES=("chrome" "cursor" "thunderbird-bin" "obsidian" "masterpdf" "antigravity")
+POLL_INTERVAL_SEC=1
+
+# ─── Backend hooks ────────────────────────────────────────────────────
+park() { pkill -STOP -f "$1"; }
+wake() { pkill -CONT -f "$1"; }
+
+detect_topology() { :; }
+apply_tier()      { :; }
+
+# ─── Lifecycle ────────────────────────────────────────────────────────
 cleanup() {
     echo "Restoring all processes..."
     for PROC in "${PROCESSES[@]}"; do
-        for PID in $(pgrep $PROC); do
-            kill -CONT $PID
-        done
+        wake "$PROC"
     done
     exit 0
 }
-
-# Trap SIGINT (Ctrl+C) and SIGTERM to call cleanup
 trap cleanup SIGINT SIGTERM EXIT
 
-# Associative array to track process status
-# RUNNING or STOPPED
+get_focused_proc_name() {
+    local wid pid
+    wid=$(xdotool getwindowfocus 2>/dev/null) || return
+    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || return
+    [[ -n "$pid" && -d "/proc/$pid" ]] || return
+    cat "/proc/$pid/comm"
+}
+
+# ─── Main loop ────────────────────────────────────────────────────────
+detect_topology
+
 declare -A PROC_STATUS
 for PROC in "${PROCESSES[@]}"; do
     PROC_STATUS[$PROC]="UNKNOWN"
 done
 
 while true; do
-    FOCUSED_PID=$(xdotool getwindowpid $(xdotool getwindowfocus))
-    # Get the process name from /proc/[PID]/comm
-    if [[ -n "$FOCUSED_PID" && -d "/proc/$FOCUSED_PID" ]]; then
-        PROC_NAME=$(cat /proc/$FOCUSED_PID/comm)
-        echo "Focused process PID: $FOCUSED_PID, Name: $PROC_NAME"
+    FOCUSED=$(get_focused_proc_name)
+    if [[ -n "$FOCUSED" ]]; then
+        echo "Focused: $FOCUSED"
     else
-        PROC_NAME=""
-        echo "No focused process found or process no longer exists."
+        echo "No focused process."
     fi
+
     for PROC in "${PROCESSES[@]}"; do
-        if [[ "$PROC" == "$PROC_NAME" ]]; then
+        if [[ "$PROC" == "$FOCUSED" ]]; then
             if [[ "${PROC_STATUS[$PROC]}" != "RUNNING" ]]; then
-                pkill -CONT -f $PROC
+                wake "$PROC"
                 echo "Wake up $PROC!"
                 PROC_STATUS[$PROC]="RUNNING"
             fi
         else
             if [[ "${PROC_STATUS[$PROC]}" != "STOPPED" ]]; then
-                pkill -STOP -f $PROC
+                park "$PROC"
                 echo "Stop $PROC"
                 PROC_STATUS[$PROC]="STOPPED"
             fi
         fi
     done
-    sleep 1
+    sleep "$POLL_INTERVAL_SEC"
 done
