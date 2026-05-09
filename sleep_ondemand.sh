@@ -19,13 +19,14 @@
 # Discovered automatically from app.slice scopes; APP_TIER below pins
 # specific names to TIGHT/LOOSE, anything else falls into DEFAULT_TIER.
 PROCESSES=()
-DISCOVERY_INTERVAL_SEC=10   # how often the background loop rescans for new PIDs
+POLL_INTERVAL_SEC=1         # focus-check cadence (xprop event wakes earlier when it fires)
+DISCOVERY_INTERVAL_SEC=10   # how often we rescan for new app scopes
 
 # Hard refusal list: any process whose comm matches will never be added
 # to PROCESSES regardless of where its scope sits. The app.slice filter
 # already excludes session.slice / system.slice, so this is belt-and-
 # braces against systemd reorganising things.
-NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|sudo|gnome-terminal-)$'
+NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|ssh-agent|sudo|gnome-terminal-)$'
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
@@ -180,8 +181,16 @@ check_cpuset_delegation() {
 SLICE_PARENT_NAME=sondemand.slice
 SLICE_ROOT_DIR=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/$SLICE_PARENT_NAME
 
+# Hyphen → underscore is one-way lossy (an app literally named foo_bar would
+# round-trip as foo-bar), but no managed app currently has underscores in
+# its friendly name.
 slice_unit_for() { echo "sondemand-${1//-/_}.slice"; }
 slice_dir_for()  { echo "$SLICE_ROOT_DIR/$(slice_unit_for "$1")"; }
+friendly_name_from_our_slice() {
+    # "/…/sondemand-foo_bar.slice" or "sondemand-foo_bar.slice" → "foo-bar"
+    local s=${1##*/}; s=${s%.slice}; s=${s#sondemand-}
+    echo "${s//_/-}"
+}
 
 ensure_slice() {
     local unit=$1
@@ -193,16 +202,26 @@ ensure_slice() {
 }
 
 migrate_pids() {
+    # Anchors PID identity to the launching app.slice scope, not cmdline
+    # (chromium forks re-exec via /proc/self/exe so cmdline matching fails).
     local proc=$1
-    local dir; dir=$(slice_dir_for "$proc")
-    [[ -d "$dir" ]] || return 0
-    declare -A in_slice
+    local our_dir; our_dir=$(slice_dir_for "$proc")
+    [[ -d "$our_dir" ]] || return 0
+    declare -A in_our_slice
     local p
-    while read -r p; do in_slice[$p]=1; done < "$dir/cgroup.procs"
-    while read -r p; do
-        [[ -z "$p" || -n "${in_slice[$p]}" ]] && continue
-        echo "$p" > "$dir/cgroup.procs" 2>/dev/null || true
-    done < <(pgrep -f "$proc" 2>/dev/null)
+    while read -r p; do in_our_slice[$p]=1; done < "$our_dir/cgroup.procs"
+
+    local scope_dir scope_name name
+    for scope_dir in "$USER_APP_SLICE"/*.scope; do
+        [[ -d "$scope_dir" ]] || continue
+        scope_name=$(basename "$scope_dir")
+        name=$(friendly_name_from_scope "$scope_name") || continue
+        [[ "$name" == "$proc" ]] || continue
+        while read -r p; do
+            [[ -z "$p" || -n "${in_our_slice[$p]}" ]] && continue
+            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
+        done < "$scope_dir/cgroup.procs"
+    done
 }
 
 # Walk app.slice scopes and rebuild PROCESSES. Called at startup and
@@ -232,21 +251,39 @@ friendly_name_from_scope() {
 }
 
 discover() {
-    [[ -d "$USER_APP_SLICE" ]] || return
     declare -A seen=()
-    local scope_dir scope name pid comm proc
+    local proc
     # Carry forward already-managed apps so that we keep flipping their
     # limits even after migrate_pids has emptied their original scope.
     for proc in "${PROCESSES[@]}"; do seen[$proc]=1; done
-    for scope_dir in "$USER_APP_SLICE"/*.scope; do
-        [[ -d "$scope_dir" ]] || continue
-        scope=$(basename "$scope_dir")
-        name=$(friendly_name_from_scope "$scope") || continue
-        pid=$(head -1 "$scope_dir/cgroup.procs" 2>/dev/null)
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null)
-        [[ -n "$comm" && "$comm" =~ $NEVER_THROTTLE_REGEX ]] && continue
-        seen[$name]=1
-    done
+
+    # New app scopes under user app.slice.
+    if [[ -d "$USER_APP_SLICE" ]]; then
+        local scope_dir scope name pid comm
+        for scope_dir in "$USER_APP_SLICE"/*.scope; do
+            [[ -d "$scope_dir" ]] || continue
+            scope=$(basename "$scope_dir")
+            name=$(friendly_name_from_scope "$scope") || continue
+            pid=$(head -1 "$scope_dir/cgroup.procs" 2>/dev/null)
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+            [[ -n "$comm" && "$comm" =~ $NEVER_THROTTLE_REGEX ]] && continue
+            seen[$name]=1
+        done
+    fi
+
+    # Recover in-flight apps already adopted in a prior session — their
+    # app.slice scope has been drained. cgroup.procs reports stat-size 0
+    # even when populated, so peek at the first line instead of `-s`.
+    if [[ -d "$SLICE_ROOT_DIR" ]]; then
+        local slice_dir first
+        for slice_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
+            [[ -d "$slice_dir" ]] || continue
+            read -r first < "$slice_dir/cgroup.procs" 2>/dev/null || continue
+            [[ -z "$first" ]] && continue
+            seen[$(friendly_name_from_our_slice "$slice_dir")]=1
+        done
+    fi
+
     PROCESSES=( "${!seen[@]}" )
     for proc in "${PROCESSES[@]}"; do
         [[ -z "${PROC_STATE[$proc]}" ]] && PROC_STATE[$proc]=UNKNOWN
@@ -255,10 +292,8 @@ discover() {
 }
 
 # ─── Lifecycle ────────────────────────────────────────────────────────
-XPROP_PID=
 cleanup() {
     echo "Restoring all processes..."
-    [[ -n "$XPROP_PID" ]] && kill "$XPROP_PID" 2>/dev/null
     # wake() resets each slice to FG defaults (unlimited). We deliberately
     # leave the slices themselves in place so that running PIDs are not
     # orphaned back to user.slice and bounced again on next script start.
@@ -270,9 +305,17 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 pid_to_proc_name() {
-    local pid=$1
+    # Anchor friendly name to the PID's current sondemand-* slice when
+    # possible — comm is misleading for chromium forks (antigravity → "chrome").
+    local pid=$1 line cg comm
     [[ -n "$pid" && -d "/proc/$pid" ]] || return
-    cat "/proc/$pid/comm" 2>/dev/null
+    read -r line < "/proc/$pid/cgroup" 2>/dev/null
+    cg=${line#*::}                                 # cgroup v2 is single-line "0::<path>"
+    if [[ "$cg" == *"/sondemand.slice/sondemand-"*".slice" ]]; then
+        friendly_name_from_our_slice "$cg"
+        return
+    fi
+    read -r comm < "/proc/$pid/comm" 2>/dev/null && echo "$comm"
 }
 
 # ─── Focus state machine ─────────────────────────────────────────────
@@ -305,26 +348,26 @@ echo "discovered: ${PROCESSES[*]}"
 for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
 LAST_DISCOVERY=$(date +%s)
 
-# Seed the initial focus state.
-INITIAL_PID=$(xdotool getwindowpid "$(xdotool getwindowfocus 2>/dev/null)" 2>/dev/null)
-apply_focus_state "$(pid_to_proc_name "$INITIAL_PID")"
+LAST_WID=
+refresh_focus() {
+    local wid pid
+    wid=$(xdotool getwindowfocus 2>/dev/null) || return
+    [[ "$wid" == "$LAST_WID" ]] && return
+    LAST_WID=$wid
+    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || return
+    apply_focus_state "$(pid_to_proc_name "$pid")"
+}
 
-# xprop -spy emits a line whenever _NET_ACTIVE_WINDOW changes (≤10 ms
-# focus latency). `read -t` doubles as a watchdog: if no focus event
-# fires within DISCOVERY_INTERVAL_SEC the read times out, giving us a
-# regular cadence to rescan app.slice and migrate newly-spawned PIDs.
-# Run xprop in a coproc with `exec` so $XPROP_PID is xprop itself —
-# cleanup() can kill it directly and the read unblocks immediately.
-coproc XPROP { exec xprop -root -spy _NET_ACTIVE_WINDOW 2>/dev/null; }
-XPROP_PID=$XPROP_PID
+refresh_focus            # seed initial state
+
+# Plain poll loop. Tried xprop -spy on _NET_ACTIVE_WINDOW for snappier
+# wake-up, but mutter on some GNOME/X11 setups leaves that property at
+# 0x0 indefinitely, so events never fire. Polling at POLL_INTERVAL_SEC
+# is the authoritative source; xdotool getwindowfocus uses XGetInputFocus
+# which actually tracks focus on those setups.
 while true; do
-    if read -t "$DISCOVERY_INTERVAL_SEC" -r line <&"${XPROP[0]}"; then
-        wid=${line##* }
-        if [[ "$wid" =~ ^0x[0-9a-fA-F]+$ ]]; then
-            pid=$(xdotool getwindowpid "$wid" 2>/dev/null)
-            apply_focus_state "$(pid_to_proc_name "$pid")"
-        fi
-    fi
+    sleep "$POLL_INTERVAL_SEC"
+    refresh_focus
     now=$(date +%s)
     if (( now - LAST_DISCOVERY >= DISCOVERY_INTERVAL_SEC )); then
         discover
