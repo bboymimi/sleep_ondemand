@@ -4,6 +4,15 @@
 # which is why this lives in user space watching focus rather than relying
 # on the kernel idle detection alone.
 #
+# One-time sudo for cpuset pinning (only needed if PIN_MODE != NONE):
+#   sudo tee /etc/systemd/system/user@.service.d/delegate.conf <<EOF
+#   [Service]
+#   Delegate=cpu cpuset io memory pids
+#   EOF
+#   sudo systemctl daemon-reload
+#   # log out and back in
+# Without this, the script auto-degrades to PIN_MODE=NONE.
+#
 # Origin notes: https://www.perplexity.ai/search/to-optimize-the-power-manageme-wBNWVr8IRQClsvu2sFBS0w
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -38,24 +47,45 @@ TIGHT_BG_CPUWEIGHT=1
 TIGHT_BG_CPU_IDLE=1
 TIGHT_BG_UCLAMP_MAX=20
 
+# Pinning policy for hybrid CPUs.
+#   LP_ONLY   — BG runs only on LP E-cores (most aggressive)
+#   E_PLUS_LP — BG runs on all E-cores incl. LP
+#   ALL_ON_E  — both BG and FG on E-cores (battery-saver mode)
+#   NONE      — no cpuset pinning (cpu.max + uclamp only)
+#   AUTO      — E_PLUS_LP if hybrid, else NONE
+PIN_MODE="${PIN_MODE:-AUTO}"
+
 # ─── Backend hooks ────────────────────────────────────────────────────
 # CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
 # and remote-agent heartbeats keep flowing while CPU is starved.
+cpus_for_tier() {
+    case "$PIN_MODE:$1" in
+        LP_ONLY:BG)    echo "$LP_E_CORES" ;;
+        E_PLUS_LP:BG)  echo "$ALL_E_CORES" ;;
+        ALL_ON_E:*)    echo "$ALL_E_CORES" ;;
+        *)             echo "" ;;            # NONE, or FG outside ALL_ON_E
+    esac
+}
+
 park() {
     local proc=$1
     local tier=${APP_TIER[$proc]:-$DEFAULT_TIER}
     local quota="${tier}_BG_CPUQUOTA"   weight="${tier}_BG_CPUWEIGHT"
     local idle="${tier}_BG_CPU_IDLE"    uclamp="${tier}_BG_UCLAMP_MAX"
     local dir; dir=$(slice_dir_for "$proc")
+    local cpus; cpus=$(cpus_for_tier BG)
     systemctl --user set-property "$(slice_unit_for "$proc")" \
-        CPUQuota="${!quota}" CPUWeight="${!weight}" 2>/dev/null || true
+        CPUQuota="${!quota}" CPUWeight="${!weight}" \
+        AllowedCPUs="$cpus" 2>/dev/null || true
     echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
 }
 wake() {
     local dir; dir=$(slice_dir_for "$1")
+    local cpus; cpus=$(cpus_for_tier FG)
     systemctl --user set-property "$(slice_unit_for "$1")" \
-        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
+        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" \
+        AllowedCPUs="$cpus" 2>/dev/null || true
     echo "$FG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
 }
@@ -117,6 +147,21 @@ detect_topology() {
     REG_E_CORES=${reg%,}
     ALL_E_CORES="${REG_E_CORES}${REG_E_CORES:+,}${LP_E_CORES}"
     echo "topology: hybrid CPU detected — P=$P_CORES regE=$REG_E_CORES LP-E=$LP_E_CORES"
+}
+
+resolve_pin_mode() {
+    [[ "$PIN_MODE" == "AUTO" ]] && PIN_MODE=$( ((HYBRID)) && echo E_PLUS_LP || echo NONE )
+}
+
+check_cpuset_delegation() {
+    [[ "$PIN_MODE" == "NONE" ]] && return
+    local f=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/cgroup.subtree_control
+    if ! grep -qw cpuset "$f" 2>/dev/null; then
+        echo "warn: cpuset is not delegated to user@.service — falling back to PIN_MODE=NONE."
+        echo "      Add 'Delegate=cpu cpuset io memory pids' to a"
+        echo "      /etc/systemd/system/user@.service.d/delegate.conf and re-login to enable."
+        PIN_MODE=NONE
+    fi
 }
 
 # ─── Slice scaffolding ────────────────────────────────────────────────
@@ -182,6 +227,9 @@ get_focused_proc_name() {
 
 # ─── Main loop ────────────────────────────────────────────────────────
 detect_topology
+resolve_pin_mode
+check_cpuset_delegation
+echo "PIN_MODE=$PIN_MODE"
 setup_slices
 
 declare -A PROC_STATE
