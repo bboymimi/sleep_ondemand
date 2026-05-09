@@ -14,21 +14,43 @@ FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimite
 FG_CPUWEIGHT=100
 FG_CPU_IDLE=0            # 0 = normal scheduling
 FG_UCLAMP_MAX=max        # full P-state range (turbo allowed)
-BG_CPUQUOTA="5%"
-BG_CPUWEIGHT=10
-BG_CPU_IDLE=1            # 1 = SCHED_IDLE: never preempts foreground
-BG_UCLAMP_MAX=30         # cap DVFS request at 30% of max — keeps the
-                         # cores in low P-states even under brief bursts
+
+# Per-app tier. LOOSE: enough headroom for network keepalives, language
+# servers, IMAP IDLE long-polls. TIGHT: local-only apps with no network
+# heartbeat to keep alive.
+declare -A APP_TIER=(
+    [chrome]=TIGHT
+    [obsidian]=TIGHT
+    [masterpdf]=TIGHT
+    [cursor]=LOOSE
+    [thunderbird-bin]=LOOSE
+    [antigravity]=LOOSE
+)
+DEFAULT_TIER=LOOSE       # used for any process not in APP_TIER
+
+LOOSE_BG_CPUQUOTA="5%"
+LOOSE_BG_CPUWEIGHT=10
+LOOSE_BG_CPU_IDLE=1
+LOOSE_BG_UCLAMP_MAX=30
+
+TIGHT_BG_CPUQUOTA="1%"
+TIGHT_BG_CPUWEIGHT=1
+TIGHT_BG_CPU_IDLE=1
+TIGHT_BG_UCLAMP_MAX=20
 
 # ─── Backend hooks ────────────────────────────────────────────────────
 # CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
 # and remote-agent heartbeats keep flowing while CPU is starved.
 park() {
-    local dir; dir=$(slice_dir_for "$1")
-    systemctl --user set-property "$(slice_unit_for "$1")" \
-        CPUQuota="$BG_CPUQUOTA" CPUWeight="$BG_CPUWEIGHT" 2>/dev/null || true
-    echo "$BG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
-    echo "$BG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
+    local proc=$1
+    local tier=${APP_TIER[$proc]:-$DEFAULT_TIER}
+    local quota="${tier}_BG_CPUQUOTA"   weight="${tier}_BG_CPUWEIGHT"
+    local idle="${tier}_BG_CPU_IDLE"    uclamp="${tier}_BG_UCLAMP_MAX"
+    local dir; dir=$(slice_dir_for "$proc")
+    systemctl --user set-property "$(slice_unit_for "$proc")" \
+        CPUQuota="${!quota}" CPUWeight="${!weight}" 2>/dev/null || true
+    echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
+    echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
 }
 wake() {
     local dir; dir=$(slice_dir_for "$1")
