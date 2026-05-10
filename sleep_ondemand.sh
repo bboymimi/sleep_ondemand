@@ -84,19 +84,19 @@ park() {
     local dir; dir=$(slice_dir_for "$proc")
     local cpus; cpus=$(cpus_for_tier BG)
     systemctl --user set-property "$(slice_unit_for "$proc")" \
-        CPUQuota="${!quota}" CPUWeight="${!weight}" \
-        AllowedCPUs="$cpus" 2>/dev/null || true
+        CPUQuota="${!quota}" CPUWeight="${!weight}" 2>/dev/null || true
     echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
+    echo "$cpus"      > "$dir/cpuset.cpus"    2>/dev/null || true
 }
 wake() {
     local dir; dir=$(slice_dir_for "$1")
     local cpus; cpus=$(cpus_for_tier FG)
     systemctl --user set-property "$(slice_unit_for "$1")" \
-        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" \
-        AllowedCPUs="$cpus" 2>/dev/null || true
+        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
     echo "$FG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
+    echo "$cpus"          > "$dir/cpuset.cpus"    2>/dev/null || true
 }
 
 apply_tier() { :; }
@@ -199,6 +199,18 @@ ensure_slice() {
     # persists, which is what we want.
     systemd-run --user --quiet --scope --slice="$unit" \
         --unit="cgcreate-$$-$RANDOM" -- /bin/true >/dev/null 2>&1 || true
+}
+
+# systemd doesn't auto-propagate cpuset to the parent slice's
+# subtree_control, so per-app slices have no cpuset.cpus files until we
+# enable it here. Idempotent: writing "+cpuset" to a subtree_control that
+# already has it is a no-op.
+enable_cpuset_subtree() {
+    [[ "$PIN_MODE" == "NONE" ]] && return
+    local f=$SLICE_ROOT_DIR/cgroup.subtree_control
+    [[ -w "$f" ]] || return
+    grep -qw cpuset "$f" 2>/dev/null && return
+    echo "+cpuset" > "$f" 2>/dev/null || true
 }
 
 migrate_pids() {
@@ -343,6 +355,7 @@ check_cpuset_delegation
 echo "PIN_MODE=$PIN_MODE"
 
 ensure_slice "$SLICE_PARENT_NAME"
+enable_cpuset_subtree
 discover
 echo "discovered: ${PROCESSES[*]}"
 for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
