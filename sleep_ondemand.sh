@@ -36,7 +36,11 @@ FREEZE_BG="${FREEZE_BG:-0}"
 # the friendly name extracted from the unit. Long entries below the |
 # separators handle the comm-truncation case (e.g. xdg-desktop-por),
 # wildcard entries handle the full friendly-name case (e.g. xdg-.*).
-NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|ssh-agent|sudo|gnome-terminal-|at-spi-bus-laun|at-spi.*|ibus-daemon|ibus.*|xdg-(desktop-por|document-po|permission-)|xdg-.*portal.*|speech-dispatch|speech-dispatcher.*|dconf-service|dconf.*|gcr-ssh-agent|gnome-remote-d|gnome-remote-desktop.*|gnome-session-.*|dbus|sharing|smartcard|color|xsettings|datetime|housekeeping|keyboard|mediakeys|power|printnotifications|rfkill|screensaverproxy|sound|wacom|a11ysettings)$'
+# Append to this from outside the script via NEVER_THROTTLE_EXTRA — set
+# it to a regex fragment (no anchors, no leading |) and it gets OR'd in
+# at startup. e.g.  NEVER_THROTTLE_EXTRA='myapp|tracker-.*' ./script.sh
+NEVER_THROTTLE_BUILTIN='gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|ssh-agent|sudo|gnome-terminal-|at-spi-bus-laun|at-spi.*|ibus-daemon|ibus.*|xdg-(desktop-por|document-po|permission-)|xdg-.*portal.*|speech-dispatch|speech-dispatcher.*|dconf-service|dconf.*|gcr-ssh-agent|gnome-remote-d|gnome-remote-desktop.*|gnome-session-.*|dbus|sharing|smartcard|color|xsettings|datetime|housekeeping|keyboard|mediakeys|power|printnotifications|rfkill|screensaverproxy|sound|wacom|a11ysettings|syncthing'
+NEVER_THROTTLE_REGEX="^($NEVER_THROTTLE_BUILTIN${NEVER_THROTTLE_EXTRA:+|$NEVER_THROTTLE_EXTRA})\$"
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
@@ -298,6 +302,21 @@ migrate_pids() {
             echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
         done < "$sibling_dir/cgroup.procs"
     done
+
+    # Rescue chromium-family PIDs that ended up in cgroups outside our
+    # discovery walk — typically chrome processes that gnome-shell or
+    # xdg-desktop-portal forked directly instead of going through the
+    # app.slice scope launcher.
+    local rescue_dir
+    for rescue_dir in "${RESCUE_CGROUPS[@]}"; do
+        [[ -d "$rescue_dir" ]] || continue
+        while read -r p; do
+            [[ -z "$p" ]] && continue
+            exe_name=$(friendly_name_from_exe "$p") || continue
+            [[ "$exe_name" == "$proc" ]] || continue
+            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
+        done < "$rescue_dir/cgroup.procs"
+    done
 }
 
 # Walk app.slice / session.slice / background.slice for managed apps.
@@ -307,6 +326,15 @@ USER_APP_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.s
 USER_SESSION_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/session.slice
 USER_BG_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/background.slice
 DISCOVERY_SLICES=("$USER_APP_SLICE" "$USER_SESSION_SLICE" "$USER_BG_SLICE")
+
+# Cgroups that aren't in DISCOVERY_SLICES but are known to occasionally
+# host chromium-family PIDs (chrome forked directly by these services
+# instead of through gnome-shell's normal app-launch path). migrate_pids
+# walks these and rescues PIDs whose exe matches a managed app.
+RESCUE_CGROUPS=(
+    "$USER_SESSION_SLICE/org.gnome.Shell@x11.service"
+    "$USER_SESSION_SLICE/xdg-desktop-portal.service"
+)
 
 # Map a PID's executable path to a stable friendly name for chromium-
 # family apps that gnome-shell tends to bucket into ambiguous scopes.
