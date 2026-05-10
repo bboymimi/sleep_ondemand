@@ -19,8 +19,8 @@
 # Discovered automatically from app.slice scopes; APP_TIER below pins
 # specific names to TIGHT/LOOSE, anything else falls into DEFAULT_TIER.
 PROCESSES=()
-POLL_INTERVAL_SEC=1         # focus-check cadence (xprop event wakes earlier when it fires)
-DISCOVERY_INTERVAL_SEC=10   # how often we rescan for new app scopes
+POLL_INTERVAL_SEC=3         # focus-check cadence
+DISCOVERY_INTERVAL_SEC=30   # how often we rescan for new app scopes
 
 # Hard refusal list: any process whose comm matches will never be added
 # to PROCESSES regardless of where its scope sits. The app.slice filter
@@ -46,12 +46,12 @@ declare -A APP_TIER=(
 )
 DEFAULT_TIER=LOOSE       # used for any process not in APP_TIER
 
-LOOSE_BG_CPUQUOTA="5%"
+LOOSE_BG_CPUQUOTA="0.1%"
 LOOSE_BG_CPUWEIGHT=10
 LOOSE_BG_CPU_IDLE=1
 LOOSE_BG_UCLAMP_MAX=30
 
-TIGHT_BG_CPUQUOTA="1%"
+TIGHT_BG_CPUQUOTA="0.1%"
 TIGHT_BG_CPUWEIGHT=1
 TIGHT_BG_CPU_IDLE=1
 TIGHT_BG_UCLAMP_MAX=20
