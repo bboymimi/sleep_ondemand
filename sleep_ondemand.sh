@@ -230,8 +230,11 @@ enable_cpuset_subtree() {
 }
 
 migrate_pids() {
-    # Anchors PID identity to the launching app.slice scope, not cmdline
-    # (chromium forks re-exec via /proc/self/exe so cmdline matching fails).
+    # Anchors PID identity to either /proc/$pid/exe (for chromium-family
+    # apps) or the launching app.slice scope name. Also rectifies PIDs
+    # that ended up in the wrong sondemand slice (e.g. a chrome PID in
+    # sondemand-antigravity.slice — they share the chromium scope-name
+    # space, so misclassification is easy).
     local proc=$1
     local our_dir; our_dir=$(slice_dir_for "$proc")
     [[ -d "$our_dir" ]] || return 0
@@ -239,6 +242,7 @@ migrate_pids() {
     local p
     while read -r p; do in_our_slice[$p]=1; done < "$our_dir/cgroup.procs"
 
+    # Pull from app.slice scopes that resolve to this friendly name.
     local scope_dir scope_name name
     for scope_dir in "$USER_APP_SLICE"/*.scope; do
         [[ -d "$scope_dir" ]] || continue
@@ -250,6 +254,20 @@ migrate_pids() {
             echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
         done < "$scope_dir/cgroup.procs"
     done
+
+    # Rectify: pull from sibling sondemand-*.slice any PID whose exe says
+    # it actually belongs to $proc. Limited to chromium-family binaries —
+    # other apps have unambiguous scope→name mappings already.
+    local sibling_dir exe_name
+    for sibling_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
+        [[ -d "$sibling_dir" && "$sibling_dir" != "$our_dir" ]] || continue
+        while read -r p; do
+            [[ -z "$p" ]] && continue
+            exe_name=$(friendly_name_from_exe "$p") || continue
+            [[ "$exe_name" == "$proc" ]] || continue
+            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
+        done < "$sibling_dir/cgroup.procs"
+    done
 }
 
 # Walk app.slice scopes and rebuild PROCESSES. Called at startup and
@@ -257,14 +275,33 @@ migrate_pids() {
 # PROC_STATE entries preserved.
 USER_APP_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.slice
 
+# Map a PID's executable path to a stable friendly name for chromium-
+# family apps that gnome-shell tends to bucket into ambiguous scopes.
+# Returns non-zero if the binary doesn't match any known pattern.
+friendly_name_from_exe() {
+    local pid=$1 exe
+    [[ -n "$pid" && -d "/proc/$pid" ]] || return 1
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    exe=${exe% (deleted)}
+    case "$exe" in
+        */antigravity/*)             echo antigravity ;;
+        */google/chrome/*)           echo chrome ;;
+        /usr/lib/chromium*/*|/usr/bin/chromium*|/snap/chromium/*) echo chromium ;;
+        *)                           return 1 ;;
+    esac
+}
+
 friendly_name_from_scope() {
-    # app-gnome-cursor-1234.scope                 -> cursor
-    # app-org.chromium.Chromium-NNN.scope         -> chromium  (last dotted)
-    # app-codex-desktop-NNN.scope                 -> codex-desktop
-    # app-gnome-codex\x2ddesktop-NNN.scope        -> codex-desktop (unescaped)
-    # snap.thunderbird.thunderbird-XX.scope       -> thunderbird
-    local s=$1 n
+    # First try the main PID's binary — chrome / antigravity / chromium
+    # all share the "app-org.chromium.Chromium-*.scope" naming on GNOME,
+    # so we can't tell them apart by scope name alone. Falling back to
+    # scope-name parsing handles every other app.
+    local s=$1 n pid
     s=${s//\\x2d/-}                       # systemd escapes hyphens
+    pid=$(head -1 "$USER_APP_SLICE/$s/cgroup.procs" 2>/dev/null)
+    if [[ -n "$pid" ]]; then
+        n=$(friendly_name_from_exe "$pid") && { echo "$n"; return; }
+    fi
     if   [[ "$s" =~ ^app-(.+)-[0-9]+\.scope$ ]]; then
         n=${BASH_REMATCH[1]}
         n=${n##*.}                        # last dotted component (org.foo.Bar -> Bar)
@@ -302,13 +339,21 @@ discover() {
     # Recover in-flight apps already adopted in a prior session — their
     # app.slice scope has been drained. cgroup.procs reports stat-size 0
     # even when populated, so peek at the first line instead of `-s`.
+    # Also pull exe-based names from each PID inside, so chromium-family
+    # binaries that ended up in the wrong slice (e.g. chrome PIDs stuck
+    # in sondemand-antigravity.slice) get a chrome.slice spawned and
+    # migrate_pids can rectify them.
     if [[ -d "$SLICE_ROOT_DIR" ]]; then
-        local slice_dir first
+        local slice_dir first p exe_name
         for slice_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
             [[ -d "$slice_dir" ]] || continue
             read -r first < "$slice_dir/cgroup.procs" 2>/dev/null || continue
             [[ -z "$first" ]] && continue
             seen[$(friendly_name_from_our_slice "$slice_dir")]=1
+            while read -r p; do
+                [[ -z "$p" ]] && continue
+                exe_name=$(friendly_name_from_exe "$p") && seen[$exe_name]=1
+            done < "$slice_dir/cgroup.procs"
         done
     fi
 
@@ -333,12 +378,15 @@ cleanup() {
 trap cleanup SIGINT SIGTERM EXIT
 
 pid_to_proc_name() {
-    # Anchor friendly name to the PID's current sondemand-* slice when
-    # possible — comm is misleading for chromium forks (antigravity → "chrome").
-    local pid=$1 line cg comm
+    # 1. exe-based lookup catches the chromium-family ambiguity
+    #    (chrome and antigravity both have comm=chrome).
+    # 2. Then sondemand-slice membership for everything else managed.
+    # 3. Then comm for unmanaged windows (terminal, gnome-shell, etc).
+    local pid=$1 line cg comm name
     [[ -n "$pid" && -d "/proc/$pid" ]] || return
+    name=$(friendly_name_from_exe "$pid") && { echo "$name"; return; }
     read -r line < "/proc/$pid/cgroup" 2>/dev/null
-    cg=${line#*::}                                 # cgroup v2 is single-line "0::<path>"
+    cg=${line#*::}
     if [[ "$cg" == *"/sondemand.slice/sondemand-"*".slice" ]]; then
         friendly_name_from_our_slice "$cg"
         return
