@@ -60,12 +60,12 @@ declare -A APP_TIER=(
 )
 DEFAULT_TIER=LOOSE       # used for any process not in APP_TIER
 
-LOOSE_BG_CPUQUOTA="5%"
+LOOSE_BG_CPUQUOTA="15%"
 LOOSE_BG_CPUWEIGHT=10
 LOOSE_BG_CPU_IDLE=1
 LOOSE_BG_UCLAMP_MAX=30
 
-TIGHT_BG_CPUQUOTA="1%"
+TIGHT_BG_CPUQUOTA="10%"
 TIGHT_BG_CPUWEIGHT=1
 TIGHT_BG_CPU_IDLE=1
 TIGHT_BG_UCLAMP_MAX=20
@@ -523,7 +523,15 @@ LAST_DISCOVERY=$(date +%s)
 LAST_WID=
 refresh_focus() {
     local wid pid
-    wid=$(xdotool getwindowfocus 2>/dev/null) || return
+    # Prefer EWMH _NET_ACTIVE_WINDOW (the WM's notion of the active app)
+    # over X11 input focus. On GNOME-on-X11, XGetInputFocus often
+    # returns the gnome-shell stage window when the user has focused a
+    # real app, which makes the script think gnome-shell is foreground
+    # and never wake the actual app. Fallback to getwindowfocus only if
+    # _NET_ACTIVE_WINDOW is unset or 0 (some compositors leave it blank).
+    wid=$(xdotool getactivewindow 2>/dev/null)
+    [[ -z "$wid" || "$wid" == "0" ]] && wid=$(xdotool getwindowfocus 2>/dev/null)
+    [[ -z "$wid" ]] && return
     [[ "$wid" == "$LAST_WID" ]] && return
     LAST_WID=$wid
     pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || return
