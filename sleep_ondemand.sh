@@ -22,6 +22,12 @@ PROCESSES=()
 POLL_INTERVAL_SEC=1         # focus-check cadence
 DISCOVERY_INTERVAL_SEC=30   # how often we rescan for new app scopes
 
+# 1 = freeze background slices via cgroup.freeze (the SIGSTOP-equivalent).
+# Stops all CPU work in those processes immediately. Network keepalives,
+# IMAP IDLE, and remote-agent connections will drop until the app is
+# refocused. Default 0 leaves them throttled but running.
+FREEZE_BG="${FREEZE_BG:-0}"
+
 # Hard refusal list: any process whose comm matches will never be added
 # to PROCESSES regardless of where its scope sits. The app.slice filter
 # already excludes session.slice / system.slice, so this is belt-and-
@@ -99,10 +105,15 @@ park() {
     echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
     [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
+    # Freeze last so any preceding writes still applied while running.
+    [[ "$FREEZE_BG" == "1" ]] && echo 1 > "$dir/cgroup.freeze" 2>/dev/null
 }
 wake() {
     local dir; dir=$(slice_dir_for "$1")
     local cpus; cpus=$(cpus_for_tier FG)
+    # Thaw first — frozen processes can't receive subsequent writes /
+    # signals, and taskset would block. Idempotent if already thawed.
+    echo 0 > "$dir/cgroup.freeze" 2>/dev/null || true
     systemctl --user set-property "$(slice_unit_for "$1")" \
         CPUQuota="$FG_CPUQUOTA" 2>/dev/null || true
     # Clear cpu.idle first so the SCHED_IDLE weight-lock releases, then
