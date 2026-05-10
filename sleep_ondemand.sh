@@ -88,8 +88,14 @@ park() {
     local idle="${tier}_BG_CPU_IDLE"    uclamp="${tier}_BG_UCLAMP_MAX"
     local dir; dir=$(slice_dir_for "$proc")
     local cpus; cpus=$(cpus_for_tier BG)
+    # CPUQuota stays via systemd (only it understands the % syntax).
+    # cpu.weight must be written before cpu.idle: SCHED_IDLE locks the
+    # weight to 1 and rejects subsequent writes. systemctl-cached state
+    # also drifts from the kernel, so direct writes are the source of
+    # truth here.
     systemctl --user set-property "$(slice_unit_for "$proc")" \
-        CPUQuota="${!quota}" CPUWeight="${!weight}" 2>/dev/null || true
+        CPUQuota="${!quota}" 2>/dev/null || true
+    echo "${!weight}" > "$dir/cpu.weight"     2>/dev/null || true
     echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
     [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
@@ -98,8 +104,11 @@ wake() {
     local dir; dir=$(slice_dir_for "$1")
     local cpus; cpus=$(cpus_for_tier FG)
     systemctl --user set-property "$(slice_unit_for "$1")" \
-        CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
+        CPUQuota="$FG_CPUQUOTA" 2>/dev/null || true
+    # Clear cpu.idle first so the SCHED_IDLE weight-lock releases, then
+    # the cpu.weight write actually takes effect.
     echo "$FG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
+    echo "$FG_CPUWEIGHT"  > "$dir/cpu.weight"     2>/dev/null || true
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
     [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
 }
