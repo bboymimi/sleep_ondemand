@@ -68,11 +68,16 @@ PIN_MODE="${PIN_MODE:-AUTO}"
 # CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
 # and remote-agent heartbeats keep flowing while CPU is starved.
 cpus_for_tier() {
+    # Returns the explicit CPU list to write to cpuset.cpus. For
+    # "unrestricted" (PIN_MODE=NONE, or FG outside ALL_ON_E) we return
+    # the full system CPU set rather than empty, because Linux 6.17's
+    # cgroup v2 cpuset silently ignores empty / whitespace writes.
     case "$PIN_MODE:$1" in
+        NONE:*)        echo "" ;;            # caller skips the write entirely
         LP_ONLY:BG)    echo "$LP_E_CORES" ;;
         E_PLUS_LP:BG)  echo "$ALL_E_CORES" ;;
         ALL_ON_E:*)    echo "$ALL_E_CORES" ;;
-        *)             echo "" ;;            # NONE, or FG outside ALL_ON_E
+        *)             echo "$ALL_CPUS" ;;   # FG with pinning enabled
     esac
 }
 
@@ -87,7 +92,7 @@ park() {
         CPUQuota="${!quota}" CPUWeight="${!weight}" 2>/dev/null || true
     echo "${!idle}"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "${!uclamp}" > "$dir/cpu.uclamp.max" 2>/dev/null || true
-    echo "$cpus"      > "$dir/cpuset.cpus"    2>/dev/null || true
+    [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
 }
 wake() {
     local dir; dir=$(slice_dir_for "$1")
@@ -96,7 +101,7 @@ wake() {
         CPUQuota="$FG_CPUQUOTA" CPUWeight="$FG_CPUWEIGHT" 2>/dev/null || true
     echo "$FG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
-    echo "$cpus"          > "$dir/cpuset.cpus"    2>/dev/null || true
+    [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
 }
 
 apply_tier() { :; }
@@ -108,6 +113,7 @@ P_CORES=""        # e.g. "0-3"
 REG_E_CORES=""    # regular E-cores, e.g. "4-11"
 LP_E_CORES=""     # low-power E-cores on the SoC tile, e.g. "12-13"
 ALL_E_CORES=""    # union of REG_E_CORES + LP_E_CORES, e.g. "4-13"
+ALL_CPUS=""       # everything, used to express "no restriction" — Linux 6.17 ignores empty writes to cpuset.cpus, so we write the full set instead
 
 # Expand a CPU range like "4-13" or "0,2,4-7" to a space-separated list.
 seq_from_range() {
@@ -124,6 +130,7 @@ seq_from_range() {
 }
 
 detect_topology() {
+    ALL_CPUS=$(cat /sys/devices/system/cpu/possible 2>/dev/null)
     [[ -d /sys/devices/cpu_core && -d /sys/devices/cpu_atom ]] || {
         echo "topology: not a hybrid CPU; cpuset pinning disabled"
         return
