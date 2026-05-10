@@ -32,7 +32,11 @@ FREEZE_BG="${FREEZE_BG:-0}"
 # to PROCESSES regardless of where its scope sits. The app.slice filter
 # already excludes session.slice / system.slice, so this is belt-and-
 # braces against systemd reorganising things.
-NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|ssh-agent|sudo|gnome-terminal-)$'
+# Matched against both /proc/$pid/comm (kernel-truncated to 15 chars) AND
+# the friendly name extracted from the unit. Long entries below the |
+# separators handle the comm-truncation case (e.g. xdg-desktop-por),
+# wildcard entries handle the full friendly-name case (e.g. xdg-.*).
+NEVER_THROTTLE_REGEX='^(gnome-shell|mutter|Xorg|Xwayland|gdm-.*|pipewire.*|wireplumber|pulseaudio|dbus-(daemon|broker)|systemd|systemd-.*|polkitd?|NetworkManager.*|wpa_supplicant|gnome-keyring.*|gvfs.*|gsd-.*|evolution-.*|bash|zsh|fish|sshd|ssh-agent|sudo|gnome-terminal-|at-spi-bus-laun|at-spi.*|ibus-daemon|ibus.*|xdg-(desktop-por|document-po|permission-)|xdg-.*portal.*|speech-dispatch|speech-dispatcher.*|dconf-service|dconf.*|gcr-ssh-agent|gnome-remote-d|gnome-remote-desktop.*|gnome-session-.*|dbus|sharing|smartcard|color|xsettings|datetime|housekeeping|keyboard|mediakeys|power|printnotifications|rfkill|screensaverproxy|sound|wacom|a11ysettings)$'
 
 FG_CPUQUOTA=""           # `set-property CPUQuota=` resets to infinity (unlimited)
 FG_CPUWEIGHT=100
@@ -264,17 +268,21 @@ migrate_pids() {
     local p
     while read -r p; do in_our_slice[$p]=1; done < "$our_dir/cgroup.procs"
 
-    # Pull from app.slice scopes that resolve to this friendly name.
-    local scope_dir scope_name name
-    for scope_dir in "$USER_APP_SLICE"/*.scope; do
-        [[ -d "$scope_dir" ]] || continue
-        scope_name=$(basename "$scope_dir")
-        name=$(friendly_name_from_scope "$scope_name") || continue
-        [[ "$name" == "$proc" ]] || continue
-        while read -r p; do
-            [[ -z "$p" || -n "${in_our_slice[$p]}" ]] && continue
-            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
-        done < "$scope_dir/cgroup.procs"
+    # Pull from app.slice / session.slice / background.slice units that
+    # resolve to this friendly name.
+    local slice_root unit_dir unit_name name
+    for slice_root in "${DISCOVERY_SLICES[@]}"; do
+        [[ -d "$slice_root" ]] || continue
+        for unit_dir in "$slice_root"/*.scope "$slice_root"/*.service; do
+            [[ -d "$unit_dir" ]] || continue
+            unit_name=$(basename "$unit_dir")
+            name=$(friendly_name_from_scope "$unit_name" "$unit_dir") || continue
+            [[ "$name" == "$proc" ]] || continue
+            while read -r p; do
+                [[ -z "$p" || -n "${in_our_slice[$p]}" ]] && continue
+                echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
+            done < "$unit_dir/cgroup.procs"
+        done
     done
 
     # Rectify: pull from sibling sondemand-*.slice any PID whose exe says
@@ -292,10 +300,13 @@ migrate_pids() {
     done
 }
 
-# Walk app.slice scopes and rebuild PROCESSES. Called at startup and
-# periodically. Idempotent: existing slices are reused, existing
-# PROC_STATE entries preserved.
+# Walk app.slice / session.slice / background.slice for managed apps.
+# Called at startup and periodically. Idempotent: existing slices are
+# reused, existing PROC_STATE entries preserved.
 USER_APP_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.slice
+USER_SESSION_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/session.slice
+USER_BG_SLICE=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/background.slice
+DISCOVERY_SLICES=("$USER_APP_SLICE" "$USER_SESSION_SLICE" "$USER_BG_SLICE")
 
 # Map a PID's executable path to a stable friendly name for chromium-
 # family apps that gnome-shell tends to bucket into ambiguous scopes.
@@ -317,10 +328,13 @@ friendly_name_from_scope() {
     # First try the main PID's binary — chrome / antigravity / chromium
     # all share the "app-org.chromium.Chromium-*.scope" naming on GNOME,
     # so we can't tell them apart by scope name alone. Falling back to
-    # scope-name parsing handles every other app.
-    local s=$1 n pid
+    # unit-name parsing handles every other app.
+    # $1 = unit basename (e.g. app-gnome-cursor-1234.scope or
+    # syncthing.service or tracker-miner-fs-3.service). $2 = optional
+    # cgroup directory (so we can read the main PID's exe).
+    local s=$1 cgdir=${2:-$USER_APP_SLICE/$1} n pid
     s=${s//\\x2d/-}                       # systemd escapes hyphens
-    pid=$(head -1 "$USER_APP_SLICE/$s/cgroup.procs" 2>/dev/null)
+    pid=$(head -1 "$cgdir/cgroup.procs" 2>/dev/null)
     if [[ -n "$pid" ]]; then
         n=$(friendly_name_from_exe "$pid") && { echo "$n"; return; }
     fi
@@ -331,6 +345,10 @@ friendly_name_from_scope() {
         n=${n#flatpak-}
     elif [[ "$s" =~ ^snap\.([^.]+)\..+\.scope$ ]]; then
         n=${BASH_REMATCH[1]}
+    elif [[ "$s" =~ ^(.+)\.service$ ]]; then
+        n=${BASH_REMATCH[1]}
+        n=${n##*.}                        # org.gnome.SettingsDaemon.X -> X
+        n=${n%@*}                         # Shell@x11 -> Shell
     else
         return 1
     fi
@@ -344,19 +362,26 @@ discover() {
     # limits even after migrate_pids has emptied their original scope.
     for proc in "${PROCESSES[@]}"; do seen[$proc]=1; done
 
-    # New app scopes under user app.slice.
-    if [[ -d "$USER_APP_SLICE" ]]; then
-        local scope_dir scope name pid comm
-        for scope_dir in "$USER_APP_SLICE"/*.scope; do
-            [[ -d "$scope_dir" ]] || continue
-            scope=$(basename "$scope_dir")
-            name=$(friendly_name_from_scope "$scope") || continue
-            pid=$(head -1 "$scope_dir/cgroup.procs" 2>/dev/null)
+    # New units under app.slice / session.slice / background.slice.
+    # We pick up both .scope (gnome-shell-launched apps) and .service
+    # (user systemd services like syncthing, tracker-miner, codex-update).
+    local slice_root unit_dir unit name pid comm
+    for slice_root in "${DISCOVERY_SLICES[@]}"; do
+        [[ -d "$slice_root" ]] || continue
+        for unit_dir in "$slice_root"/*.scope "$slice_root"/*.service; do
+            [[ -d "$unit_dir" ]] || continue
+            unit=$(basename "$unit_dir")
+            name=$(friendly_name_from_scope "$unit" "$unit_dir") || continue
+            # Filter by friendly name AND main PID's comm — comm gets
+            # kernel-truncated to 15 chars so the regex needs both
+            # forms to be safe.
+            [[ "$name" =~ $NEVER_THROTTLE_REGEX ]] && continue
+            pid=$(head -1 "$unit_dir/cgroup.procs" 2>/dev/null)
             comm=$(cat "/proc/$pid/comm" 2>/dev/null)
             [[ -n "$comm" && "$comm" =~ $NEVER_THROTTLE_REGEX ]] && continue
             seen[$name]=1
         done
-    fi
+    done
 
     # Recover in-flight apps already adopted in a prior session — their
     # app.slice scope has been drained. cgroup.procs reports stat-size 0
@@ -366,12 +391,19 @@ discover() {
     # in sondemand-antigravity.slice) get a chrome.slice spawned and
     # migrate_pids can rectify them.
     if [[ -d "$SLICE_ROOT_DIR" ]]; then
-        local slice_dir first p exe_name
+        local slice_dir first p exe_name slice_name
         for slice_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
             [[ -d "$slice_dir" ]] || continue
             read -r first < "$slice_dir/cgroup.procs" 2>/dev/null || continue
             [[ -z "$first" ]] && continue
-            seen[$(friendly_name_from_our_slice "$slice_dir")]=1
+            slice_name=$(friendly_name_from_our_slice "$slice_dir")
+            # If the policy now forbids this name (regex strengthened
+            # since the slice was created), thaw and skip it.
+            if [[ "$slice_name" =~ $NEVER_THROTTLE_REGEX ]]; then
+                echo 0 > "$slice_dir/cgroup.freeze" 2>/dev/null
+                continue
+            fi
+            seen[$slice_name]=1
             while read -r p; do
                 [[ -z "$p" ]] && continue
                 exe_name=$(friendly_name_from_exe "$p") && seen[$exe_name]=1
