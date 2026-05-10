@@ -247,16 +247,24 @@ ensure_slice() {
         --unit="cgcreate-$$-$RANDOM" -- /bin/true >/dev/null 2>&1 || true
 }
 
-# systemd doesn't auto-propagate cpuset to the parent slice's
-# subtree_control, so per-app slices have no cpuset.cpus files until we
-# enable it here. Idempotent: writing "+cpuset" to a subtree_control that
+# Ensure cpuset is propagated all the way down from user@.service to our
+# sondemand.slice. systemd's Delegate=cpuset directive is supposed to
+# populate user@.service/cgroup.subtree_control automatically on start,
+# but on some distros / systemd versions it doesn't, leaving cpuset
+# unavailable to descendants. Walk each level and add cpuset where it's
+# missing. Idempotent: writing "+cpuset" to a subtree_control that
 # already has it is a no-op.
 enable_cpuset_subtree() {
     [[ "$PIN_MODE" == "NONE" ]] && return
-    local f=$SLICE_ROOT_DIR/cgroup.subtree_control
-    [[ -w "$f" ]] || return
-    grep -qw cpuset "$f" 2>/dev/null && return
-    echo "+cpuset" > "$f" 2>/dev/null || true
+    local f
+    for f in \
+        /sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/cgroup.subtree_control \
+        "$SLICE_ROOT_DIR/cgroup.subtree_control"
+    do
+        [[ -w "$f" ]] || continue
+        grep -qw cpuset "$f" 2>/dev/null && continue
+        echo "+cpuset" > "$f" 2>/dev/null || true
+    done
 }
 
 migrate_pids() {
@@ -497,11 +505,16 @@ apply_focus_state() {
 # ─── Main ────────────────────────────────────────────────────────────
 detect_topology
 resolve_pin_mode
+
+# Order matters: create our parent slice and push cpuset down through
+# user@.service AND sondemand.slice BEFORE the delegation check, so
+# the check sees the freshly-enabled controller and AUTO mode doesn't
+# fall back to NONE on every boot.
+ensure_slice "$SLICE_PARENT_NAME"
+enable_cpuset_subtree
 check_cpuset_delegation
 echo "PIN_MODE=$PIN_MODE"
 
-ensure_slice "$SLICE_PARENT_NAME"
-enable_cpuset_subtree
 discover
 echo "discovered: ${PROCESSES[*]}"
 for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
