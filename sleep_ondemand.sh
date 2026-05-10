@@ -19,7 +19,7 @@
 # Discovered automatically from app.slice scopes; APP_TIER below pins
 # specific names to TIGHT/LOOSE, anything else falls into DEFAULT_TIER.
 PROCESSES=()
-POLL_INTERVAL_SEC=3         # focus-check cadence
+POLL_INTERVAL_SEC=1         # focus-check cadence
 DISCOVERY_INTERVAL_SEC=30   # how often we rescan for new app scopes
 
 # Hard refusal list: any process whose comm matches will never be added
