@@ -110,7 +110,18 @@ wake() {
     echo "$FG_CPU_IDLE"   > "$dir/cpu.idle"       2>/dev/null || true
     echo "$FG_CPUWEIGHT"  > "$dir/cpu.weight"     2>/dev/null || true
     echo "$FG_UCLAMP_MAX" > "$dir/cpu.uclamp.max" 2>/dev/null || true
-    [[ -n "$cpus" ]] && echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
+    if [[ -n "$cpus" ]]; then
+        echo "$cpus" > "$dir/cpuset.cpus" 2>/dev/null
+        # cgroup cpuset widening doesn't propagate to threads that are
+        # currently blocked (they keep the narrower mask until next
+        # schedule). Force-update each thread's affinity so the focused
+        # app can immediately use all cores.
+        local p
+        while read -r p; do
+            [[ -z "$p" ]] && continue
+            taskset -apc "$cpus" "$p" >/dev/null 2>&1
+        done < "$dir/cgroup.procs"
+    fi
 }
 
 apply_tier() { :; }
