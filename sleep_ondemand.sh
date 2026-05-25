@@ -81,6 +81,33 @@ PIN_MODE="${PIN_MODE:-AUTO}"
 # ─── Backend hooks ────────────────────────────────────────────────────
 # CPUQuota/CPUWeight throttle via systemd so TCP keepalives, IMAP IDLE,
 # and remote-agent heartbeats keep flowing while CPU is starved.
+is_on_ac() {
+    # 1. Try standard on_ac_power utility
+    if command -v on_ac_power >/dev/null 2>&1; then
+        on_ac_power
+        return $?
+    fi
+
+    # 2. Try direct sysfs check for standard AC directory
+    if [[ -f /sys/class/power_supply/AC/online ]]; then
+        [[ "$(cat /sys/class/power_supply/AC/online 2>/dev/null)" == "1" ]] && return 0
+        return 1
+    fi
+
+    # 3. Fallback: Search all power supplies of type Mains
+    local psy
+    for psy in /sys/class/power_supply/*; do
+        if [[ -f "$psy/type" && -f "$psy/online" ]]; then
+            if [[ "$(cat "$psy/type" 2>/dev/null)" == "Mains" ]]; then
+                [[ "$(cat "$psy/online" 2>/dev/null)" == "1" ]] && return 0
+            fi
+        fi
+    done
+
+    # Default fallback: assume on battery (return 1) so sleep-on-demand remains active
+    return 1
+}
+
 cpus_for_tier() {
     # Returns the explicit CPU list to write to cpuset.cpus. For
     # "unrestricted" (PIN_MODE=NONE, or FG outside ALL_ON_E) we return
@@ -489,14 +516,25 @@ declare -A PROC_STATE  # populated by discover()
 
 apply_focus_state() {
     local focused=$1
+    local on_ac=0
+    if is_on_ac; then
+        on_ac=1
+    fi
+
     for PROC in "${PROCESSES[@]}"; do
-        if [[ "$PROC" == "$focused" ]]; then
+        if (( on_ac )) || [[ "$PROC" == "$focused" ]]; then
             if [[ "${PROC_STATE[$PROC]}" != "FG" ]]; then
-                wake "$PROC"; echo "FG: $PROC"; PROC_STATE[$PROC]="FG"
+                wake "$PROC"
+                if (( on_ac )); then
+                    echo "FG: $PROC (unthrottled via AC)"
+                else
+                    echo "FG: $PROC (unthrottled via Focus)"
+                fi
+                PROC_STATE[$PROC]="FG"
             fi
         else
             if [[ "${PROC_STATE[$PROC]}" != "BG" ]]; then
-                park "$PROC"; echo "BG: $PROC"; PROC_STATE[$PROC]="BG"
+                park "$PROC"; echo "BG: $PROC (throttled)"; PROC_STATE[$PROC]="BG"
             fi
         fi
     done
@@ -519,6 +557,9 @@ discover
 echo "discovered: ${PROCESSES[*]}"
 for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
 LAST_DISCOVERY=$(date +%s)
+
+is_on_ac && LAST_AC_STATUS=1 || LAST_AC_STATUS=0
+echo "Initial power state: AC online=$LAST_AC_STATUS"
 
 LAST_WID=
 refresh_focus() {
@@ -547,6 +588,18 @@ refresh_focus            # seed initial state
 # which actually tracks focus on those setups.
 while true; do
     sleep "$POLL_INTERVAL_SEC"
+
+    current_ac=0
+    if is_on_ac; then
+        current_ac=1
+    fi
+
+    if [[ "$current_ac" != "$LAST_AC_STATUS" ]]; then
+        echo "Power state transition: AC online=$current_ac (was $LAST_AC_STATUS)"
+        LAST_AC_STATUS=$current_ac
+        LAST_WID= # Force refresh_focus to run apply_focus_state
+    fi
+
     refresh_focus
     now=$(date +%s)
     if (( now - LAST_DISCOVERY >= DISCOVERY_INTERVAL_SEC )); then
