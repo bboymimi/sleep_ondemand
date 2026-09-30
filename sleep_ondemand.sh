@@ -259,10 +259,15 @@ SLICE_ROOT_DIR=/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/$SLIC
 # its friendly name.
 slice_unit_for() { echo "sondemand-${1//-/_}.slice"; }
 slice_dir_for()  { echo "$SLICE_ROOT_DIR/$(slice_unit_for "$1")"; }
+
+# The name helpers below return through $REPLY instead of stdout: they
+# run once per PID on every discovery pass, and each $(...) is a fork.
+# At ~200 PIDs the forks added up to 8-17 s per pass, during which the
+# focus loop was blind and a frozen app could miss mutter's 5 s ping.
 friendly_name_from_our_slice() {
     # "/…/sondemand-foo_bar.slice" or "sondemand-foo_bar.slice" → "foo-bar"
     local s=${1##*/}; s=${s%.slice}; s=${s#sondemand-}
-    echo "${s//_/-}"
+    REPLY=${s//_/-}
 }
 
 ensure_slice() {
@@ -300,57 +305,52 @@ migrate_pids() {
     # that ended up in the wrong sondemand slice (e.g. a chrome PID in
     # sondemand-antigravity.slice — they share the chromium scope-name
     # space, so misclassification is easy).
-    local proc=$1
-    local our_dir; our_dir=$(slice_dir_for "$proc")
-    [[ -d "$our_dir" ]] || return 0
-    declare -A in_our_slice
-    local p
-    while read -r p; do in_our_slice[$p]=1; done < "$our_dir/cgroup.procs"
+    # One pass over every source cgroup for all managed apps at once;
+    # the old one-pass-per-app walk was O(apps × PIDs).
+    declare -A managed=()
+    local proc
+    for proc in "${PROCESSES[@]}"; do managed[$proc]=1; done
 
     # Pull from app.slice / session.slice / background.slice units that
-    # resolve to this friendly name.
-    local slice_root unit_dir unit_name name
+    # resolve to a managed friendly name.
+    local slice_root unit_dir p first dst
     for slice_root in "${DISCOVERY_SLICES[@]}"; do
         [[ -d "$slice_root" ]] || continue
         for unit_dir in "$slice_root"/*.scope "$slice_root"/*.service; do
             [[ -d "$unit_dir" ]] || continue
-            unit_name=$(basename "$unit_dir")
-            name=$(friendly_name_from_scope "$unit_name" "$unit_dir") || continue
-            [[ "$name" == "$proc" ]] || continue
+            # Already-drained scopes are the common case; skip them
+            # before paying for name resolution.
+            first=
+            read -r first < "$unit_dir/cgroup.procs" 2>/dev/null
+            [[ -z "$first" ]] && continue
+            friendly_name_from_scope "${unit_dir##*/}" "$unit_dir" || continue
+            [[ -n "${managed[$REPLY]}" ]] || continue
+            dst="$SLICE_ROOT_DIR/sondemand-${REPLY//-/_}.slice"
+            [[ -d "$dst" ]] || continue
             while read -r p; do
-                [[ -z "$p" || -n "${in_our_slice[$p]}" ]] && continue
-                echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
+                [[ -z "$p" ]] && continue
+                echo "$p" > "$dst/cgroup.procs" 2>/dev/null || true
             done < "$unit_dir/cgroup.procs"
         done
     done
 
     # Rectify: pull from sibling sondemand-*.slice any PID whose exe says
-    # it actually belongs to $proc. Limited to chromium-family binaries —
-    # other apps have unambiguous scope→name mappings already.
-    local sibling_dir exe_name
-    for sibling_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
-        [[ -d "$sibling_dir" && "$sibling_dir" != "$our_dir" ]] || continue
+    # it actually belongs to another managed app. Limited to chromium-
+    # family binaries — other apps have unambiguous scope→name mappings.
+    # Rescue: same for cgroups outside our discovery walk — typically
+    # chrome processes that gnome-shell or xdg-desktop-portal forked
+    # directly instead of going through the app.slice scope launcher.
+    local src
+    for src in "$SLICE_ROOT_DIR"/sondemand-*.slice "${RESCUE_CGROUPS[@]}"; do
+        [[ -d "$src" ]] || continue
         while read -r p; do
             [[ -z "$p" ]] && continue
-            exe_name=$(friendly_name_from_exe "$p") || continue
-            [[ "$exe_name" == "$proc" ]] || continue
-            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
-        done < "$sibling_dir/cgroup.procs"
-    done
-
-    # Rescue chromium-family PIDs that ended up in cgroups outside our
-    # discovery walk — typically chrome processes that gnome-shell or
-    # xdg-desktop-portal forked directly instead of going through the
-    # app.slice scope launcher.
-    local rescue_dir
-    for rescue_dir in "${RESCUE_CGROUPS[@]}"; do
-        [[ -d "$rescue_dir" ]] || continue
-        while read -r p; do
-            [[ -z "$p" ]] && continue
-            exe_name=$(friendly_name_from_exe "$p") || continue
-            [[ "$exe_name" == "$proc" ]] || continue
-            echo "$p" > "$our_dir/cgroup.procs" 2>/dev/null || true
-        done < "$rescue_dir/cgroup.procs"
+            friendly_name_from_exe "$p" || continue
+            [[ -n "${managed[$REPLY]}" ]] || continue
+            dst="$SLICE_ROOT_DIR/sondemand-${REPLY//-/_}.slice"
+            [[ "$dst" != "$src" && -d "$dst" ]] || continue
+            echo "$p" > "$dst/cgroup.procs" 2>/dev/null || true
+        done < "$src/cgroup.procs"
     done
 }
 
@@ -374,17 +374,41 @@ RESCUE_CGROUPS=(
 # Map a PID's executable path to a stable friendly name for chromium-
 # family apps that gnome-shell tends to bucket into ambiguous scopes.
 # Returns non-zero if the binary doesn't match any known pattern.
+# readlink is the one fork we can't avoid, so results are cached per PID,
+# keyed on "<starttime> <comm>" from /proc/$pid/stat: starttime catches
+# PID reuse, comm catches a wrapper script exec'ing the real binary.
+declare -A EXE_NAME_CACHE=()   # pid -> "<starttime> <comm>|<name or empty>"
 friendly_name_from_exe() {
-    local pid=$1 exe
-    [[ -n "$pid" && -d "/proc/$pid" ]] || return 1
-    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
-    exe=${exe% (deleted)}
-    case "$exe" in
-        */antigravity/*)             echo antigravity ;;
-        */google/chrome/*)           echo chrome ;;
-        /usr/lib/chromium*/*|/usr/bin/chromium*|/snap/chromium/*) echo chromium ;;
-        *)                           return 1 ;;
-    esac
+    local pid=$1 stat key exe
+    REPLY=
+    [[ -n "$pid" ]] || return 1
+    read -r stat < "/proc/$pid/stat" 2>/dev/null || return 1
+    # stat is "pid (comm) state ppid ...": comm may contain spaces, so
+    # split only after the last ')'. starttime is field 22 overall.
+    local -a f
+    read -ra f <<< "${stat##*) }"
+    key="${f[19]} ${stat#*(}"; key=${key%)*}
+    local hit=${EXE_NAME_CACHE[$pid]}
+    if [[ -n "$hit" && "${hit%|*}" == "$key" ]]; then
+        REPLY=${hit##*|}
+    else
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        exe=${exe% (deleted)}
+        case "$exe" in
+            */antigravity/*)             REPLY=antigravity ;;
+            */google/chrome/*)           REPLY=chrome ;;
+            /usr/lib/chromium*/*|/usr/bin/chromium*|/snap/chromium/*) REPLY=chromium ;;
+        esac
+        EXE_NAME_CACHE[$pid]="$key|$REPLY"
+    fi
+    [[ -n "$REPLY" ]]
+}
+
+prune_exe_cache() {
+    local pid
+    for pid in "${!EXE_NAME_CACHE[@]}"; do
+        [[ -d "/proc/$pid" ]] || unset "EXE_NAME_CACHE[$pid]"
+    done
 }
 
 friendly_name_from_scope() {
@@ -395,12 +419,11 @@ friendly_name_from_scope() {
     # $1 = unit basename (e.g. app-gnome-cursor-1234.scope or
     # syncthing.service or tracker-miner-fs-3.service). $2 = optional
     # cgroup directory (so we can read the main PID's exe).
-    local s=$1 cgdir=${2:-$USER_APP_SLICE/$1} n pid
+    local s=$1 cgdir=${2:-$USER_APP_SLICE/$1} n pid=
     s=${s//\\x2d/-}                       # systemd escapes hyphens
-    pid=$(head -1 "$cgdir/cgroup.procs" 2>/dev/null)
-    if [[ -n "$pid" ]]; then
-        n=$(friendly_name_from_exe "$pid") && { echo "$n"; return; }
-    fi
+    read -r pid < "$cgdir/cgroup.procs" 2>/dev/null
+    [[ -n "$pid" ]] && friendly_name_from_exe "$pid" && return 0
+    REPLY=
     if   [[ "$s" =~ ^app-(.+)-[0-9]+\.scope$ ]]; then
         n=${BASH_REMATCH[1]}
         n=${n##*.}                        # last dotted component (org.foo.Bar -> Bar)
@@ -415,7 +438,7 @@ friendly_name_from_scope() {
     else
         return 1
     fi
-    echo "${n,,}"
+    REPLY=${n,,}
 }
 
 discover() {
@@ -433,14 +456,16 @@ discover() {
         [[ -d "$slice_root" ]] || continue
         for unit_dir in "$slice_root"/*.scope "$slice_root"/*.service; do
             [[ -d "$unit_dir" ]] || continue
-            unit=$(basename "$unit_dir")
-            name=$(friendly_name_from_scope "$unit" "$unit_dir") || continue
+            unit=${unit_dir##*/}
+            friendly_name_from_scope "$unit" "$unit_dir" || continue
+            name=$REPLY
             # Filter by friendly name AND main PID's comm — comm gets
             # kernel-truncated to 15 chars so the regex needs both
             # forms to be safe.
             [[ "$name" =~ $NEVER_THROTTLE_REGEX ]] && continue
-            pid=$(head -1 "$unit_dir/cgroup.procs" 2>/dev/null)
-            comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+            pid= comm=
+            read -r pid < "$unit_dir/cgroup.procs" 2>/dev/null
+            [[ -n "$pid" ]] && read -r comm < "/proc/$pid/comm" 2>/dev/null
             [[ -n "$comm" && "$comm" =~ $NEVER_THROTTLE_REGEX ]] && continue
             seen[$name]=1
         done
@@ -454,12 +479,13 @@ discover() {
     # in sondemand-antigravity.slice) get a chrome.slice spawned and
     # migrate_pids can rectify them.
     if [[ -d "$SLICE_ROOT_DIR" ]]; then
-        local slice_dir first p exe_name slice_name
+        local slice_dir first p slice_name
         for slice_dir in "$SLICE_ROOT_DIR"/sondemand-*.slice; do
             [[ -d "$slice_dir" ]] || continue
             read -r first < "$slice_dir/cgroup.procs" 2>/dev/null || continue
             [[ -z "$first" ]] && continue
-            slice_name=$(friendly_name_from_our_slice "$slice_dir")
+            friendly_name_from_our_slice "$slice_dir"
+            slice_name=$REPLY
             # If the policy now forbids this name (regex strengthened
             # since the slice was created), thaw and skip it.
             if [[ "$slice_name" =~ $NEVER_THROTTLE_REGEX ]]; then
@@ -469,7 +495,7 @@ discover() {
             seen[$slice_name]=1
             while read -r p; do
                 [[ -z "$p" ]] && continue
-                exe_name=$(friendly_name_from_exe "$p") && seen[$exe_name]=1
+                friendly_name_from_exe "$p" && seen[$REPLY]=1
             done < "$slice_dir/cgroup.procs"
         done
     fi
@@ -477,8 +503,12 @@ discover() {
     PROCESSES=( "${!seen[@]}" )
     for proc in "${PROCESSES[@]}"; do
         [[ -z "${PROC_STATE[$proc]}" ]] && PROC_STATE[$proc]=UNKNOWN
-        ensure_slice "$(slice_unit_for "$proc")"
+        # The slice's cgroup dir exists iff systemd has it realised, so
+        # only shell out to systemctl for slices that are missing.
+        [[ -d "$SLICE_ROOT_DIR/sondemand-${proc//-/_}.slice" ]] ||
+            ensure_slice "$(slice_unit_for "$proc")"
     done
+    prune_exe_cache
 }
 
 # ─── Lifecycle ────────────────────────────────────────────────────────
@@ -499,26 +529,48 @@ pid_to_proc_name() {
     #    (chrome and antigravity both have comm=chrome).
     # 2. Then sondemand-slice membership for everything else managed.
     # 3. Then comm for unmanaged windows (terminal, gnome-shell, etc).
-    local pid=$1 line cg comm name
+    # Result in $REPLY (empty if the PID is gone).
+    local pid=$1 line cg
+    REPLY=
     [[ -n "$pid" && -d "/proc/$pid" ]] || return
-    name=$(friendly_name_from_exe "$pid") && { echo "$name"; return; }
+    friendly_name_from_exe "$pid" && return
     read -r line < "/proc/$pid/cgroup" 2>/dev/null
     cg=${line#*::}
     if [[ "$cg" == *"/sondemand.slice/sondemand-"*".slice" ]]; then
         friendly_name_from_our_slice "$cg"
         return
     fi
-    read -r comm < "/proc/$pid/comm" 2>/dev/null && echo "$comm"
+    read -r REPLY < "/proc/$pid/comm" 2>/dev/null
 }
 
 # ─── Focus state machine ─────────────────────────────────────────────
+# PROC_STATE: UNKNOWN → FG / BG. With FREEZE_BG=1 a BG app can also go
+# to THAWED: still throttled, but runnable (see apply_focus_state).
 declare -A PROC_STATE  # populated by discover()
+
+# Focus owners that are the compositor itself rather than an app.
+SHELL_FOCUS_REGEX='^(gnome-shell|mutter)$'
 
 apply_focus_state() {
     local focused=$1
     local on_ac=0
     if is_on_ac; then
         on_ac=1
+    fi
+
+    # Mutter pings a window when it gains focus and shows "not
+    # responding" if there's no reply within check-alive-timeout (5 s).
+    # Once that dialog is up it owns focus, _NET_ACTIVE_WINDOW goes to
+    # 0 and we'd never see the frozen app become active, so it would
+    # never be thawed. Same for the overview: the user is about to pick
+    # an app we can't identify yet. So when focus sits on the shell (or
+    # on nothing), thaw every frozen app while keeping its throttles;
+    # the ping is answered, the dialog goes away, and the next real
+    # focus change re-freezes whatever stays in the background.
+    local shell_focus=0
+    if [[ "$FREEZE_BG" == "1" ]] &&
+       [[ -z "$focused" || "$focused" =~ $SHELL_FOCUS_REGEX ]]; then
+        shell_focus=1
     fi
 
     for PROC in "${PROCESSES[@]}"; do
@@ -532,10 +584,25 @@ apply_focus_state() {
                 fi
                 PROC_STATE[$PROC]="FG"
             fi
-        else
-            if [[ "${PROC_STATE[$PROC]}" != "BG" ]]; then
-                park "$PROC"; echo "BG: $PROC (throttled)"; PROC_STATE[$PROC]="BG"
+        elif (( shell_focus )); then
+            [[ "${PROC_STATE[$PROC]}" == "FG" ]] && continue
+            # Also covers UNKNOWN slices left frozen by a killed run.
+            echo 0 > "$(slice_dir_for "$PROC")/cgroup.freeze" 2>/dev/null || true
+            if [[ "${PROC_STATE[$PROC]}" == "BG" ]]; then
+                echo "THAW: $PROC (shell has focus; still throttled)"
+                PROC_STATE[$PROC]="THAWED"
             fi
+        else
+            case "${PROC_STATE[$PROC]}" in
+                BG) ;;
+                THAWED)
+                    # Throttles from the earlier park() are still in
+                    # place; only the freeze needs restoring.
+                    echo 1 > "$(slice_dir_for "$PROC")/cgroup.freeze" 2>/dev/null
+                    echo "BG: $PROC (re-frozen)"; PROC_STATE[$PROC]="BG" ;;
+                *)
+                    park "$PROC"; echo "BG: $PROC (throttled)"; PROC_STATE[$PROC]="BG" ;;
+            esac
         fi
     done
 }
@@ -555,7 +622,7 @@ echo "PIN_MODE=$PIN_MODE"
 
 discover
 echo "discovered: ${PROCESSES[*]}"
-for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
+migrate_pids
 LAST_DISCOVERY=$(date +%s)
 
 is_on_ac && LAST_AC_STATUS=1 || LAST_AC_STATUS=0
@@ -575,8 +642,12 @@ refresh_focus() {
     [[ -z "$wid" ]] && return
     [[ "$wid" == "$LAST_WID" ]] && return
     LAST_WID=$wid
-    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) || return
-    apply_focus_state "$(pid_to_proc_name "$pid")"
+    REPLY=
+    pid=$(xdotool getwindowpid "$wid" 2>/dev/null) && pid_to_proc_name "$pid"
+    # An unattributable window only matters when something may be frozen
+    # behind it (apply_focus_state treats it like shell focus).
+    [[ -z "$REPLY" && "$FREEZE_BG" != "1" ]] && return
+    apply_focus_state "$REPLY"
 }
 
 refresh_focus            # seed initial state
@@ -604,7 +675,7 @@ while true; do
     now=$(date +%s)
     if (( now - LAST_DISCOVERY >= DISCOVERY_INTERVAL_SEC )); then
         discover
-        for proc in "${PROCESSES[@]}"; do migrate_pids "$proc"; done
+        migrate_pids
         LAST_DISCOVERY=$now
     fi
 done
